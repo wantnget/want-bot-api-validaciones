@@ -55,6 +55,14 @@ def normalizar_numero(numero: str) -> str:
     return re.sub(r"\D", "", numero)
 
 
+def normalizar_valor(valor: str):
+    """'$ 3.000.000' -> 3000000 (int). Sin puntos, comas, pesos ni otros caracteres."""
+    if not valor:
+        return None
+    solo_digitos = re.sub(r"\D", "", valor)
+    return int(solo_digitos) if solo_digitos else None
+
+
 # ---------- Extracción de texto ----------
 
 def extraer_texto_pdf(contenido_bytes: bytes) -> str:
@@ -81,10 +89,10 @@ def extraer_datos_carta_laboral(texto: str):
     return normalizar_nombre(nombre), normalizar_numero(cedula)
 
 
-# ---------- Desprendible de Pago ----------
+# ---------- Desprendible de Pago: nombre y cédula ----------
 
 def extraer_datos_desprendible_tabla(pdf_bytes: bytes):
-    """Extrae por tablas: une correctamente celdas con nombre en varias lineas."""
+    """Extrae por tablas: une correctamente celdas con nombre en varias líneas."""
     nombre = None
     cedula = None
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -102,7 +110,7 @@ def extraer_datos_desprendible_tabla(pdf_bytes: bytes):
 
 
 def extraer_datos_desprendible_texto(texto: str):
-    """Fallback por texto plano (PDFs sin lineas de tabla detectables)."""
+    """Fallback por texto plano (PDFs sin líneas de tabla detectables)."""
     cedula_match = re.search(
         r"C[eé]dula\s*:?\s*([\d\.,]{6,})", texto, re.IGNORECASE
     )
@@ -127,6 +135,91 @@ def extraer_datos_desprendible(pdf_bytes: bytes):
         cedula = cedula or cedula_txt
 
     return nombre, cedula
+
+
+# ---------- Desprendible de Pago: conceptos monetarios ----------
+
+def extraer_conceptos_desprendible(pdf_bytes: bytes) -> dict:
+    """
+    Extrae todos los conceptos monetarios del desprendible.
+    Devuelve dict {concepto_normalizado: valor_int}, ej:
+    {'salario basico': 3000000, 'aporte salud (4%)': 120000, ...}
+    Toma filas de tabla de 2 columnas donde la segunda es un valor '$ ...'.
+    Fallback: parsea líneas de texto 'concepto $ valor'.
+    """
+    conceptos = {}
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for pagina in pdf.pages:
+            for tabla in pagina.extract_tables():
+                for fila in tabla:
+                    celdas = [(c or "").replace("\n", " ").strip() for c in fila]
+                    if len(celdas) == 2 and celdas[1].lstrip().startswith("$"):
+                        clave = quitar_tildes(celdas[0]).lower().strip()
+                        valor = normalizar_valor(celdas[1])
+                        if clave and valor is not None:
+                            conceptos[clave] = valor
+
+    if not conceptos:
+        # Fallback texto plano: "Salario básico $ 3.000.000"
+        texto = extraer_texto_pdf(pdf_bytes)
+        for linea in texto.splitlines():
+            m = re.match(r"^(.+?)\s+\$\s*([\d\.,]+)\s*$", linea.strip())
+            if m:
+                clave = quitar_tildes(m.group(1)).lower().strip()
+                valor = normalizar_valor(m.group(2))
+                if clave and valor is not None:
+                    conceptos[clave] = valor
+
+    return conceptos
+
+
+def calcular_campos(conceptos: dict) -> dict:
+    """
+    Calcula desde los conceptos normalizados del desprendible:
+      - Ingreso            = salario basico
+      - Descuentos de ley  = aportes salud + aportes pension
+      - Descuentos Fondo   = todo concepto que contenga 'fondo' (excluye totales)
+      - Otros descuentos   = total deducciones - ley - fondo
+      - Total descuentos   = total deducciones
+    """
+    ingreso = None
+    salud = 0
+    pension = 0
+    total_deducciones = None
+    descuentos_fondo = 0
+
+    for clave, valor in conceptos.items():
+        if valor is None:
+            continue
+        if "salario basico" in clave:
+            ingreso = valor
+        elif "salud" in clave:
+            salud += valor
+        elif "pension" in clave:
+            pension += valor
+        elif clave.startswith("total deducciones"):
+            total_deducciones = valor
+
+        if "fondo" in clave and not clave.startswith("total"):
+            descuentos_fondo += valor
+
+    descuentos_ley = salud + pension
+
+    if total_deducciones is None:
+        raise ValueError("No se encontró 'Total deducciones' en el desprendible")
+    if ingreso is None:
+        raise ValueError("No se encontró 'Salario básico' en el desprendible")
+
+    otros_descuentos = total_deducciones - descuentos_ley - descuentos_fondo
+
+    return {
+        "ingreso": ingreso,
+        "descuentos_ley": descuentos_ley,
+        "descuentos_fondo": descuentos_fondo,
+        "otros_descuentos": otros_descuentos,
+        "total_descuentos": total_deducciones,
+    }
 
 
 # ---------- Obtener documentos por radicado ----------
@@ -285,6 +378,21 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         },
     }
 
+    # ---- Campos calculados: SOLO si resultado_validacion = 1 ----
+    if resultado_validacion == 1:
+        try:
+            conceptos = extraer_conceptos_desprendible(documentos["desprendible"])
+            out["campos_calculados"] = calcular_campos(conceptos)
+        except ValueError as exc:
+            log.warning("fallo campos calculados", extra={
+                        "radicado": radicado, "error": str(exc)})
+            return func.HttpResponse(
+                json.dumps({"status": "error", "radicado": radicado,
+                            "error": f"Error calculando campos: {str(exc)[:200]}"}),
+                status_code=422,
+                mimetype="application/json",
+            )
+
     log.info("validacion completada", extra={
         "radicado": radicado,
         "resultado_validacion": resultado_validacion,
@@ -294,4 +402,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         json.dumps(out, ensure_ascii=False),
         status_code=200,
         mimetype="application/json",
-    )
+    ) 
