@@ -17,7 +17,7 @@ from shared import db_client
 
 log = get_logger("descargar_truora")
 
-CAMPOS_REQUERIDOS = ("link", "radicado")
+CAMPOS_REQUERIDOS = ("link", "radicado", "tipo_documento")
 
 
 def _validar_campos(payload: dict) -> list:
@@ -50,6 +50,40 @@ def verificar_expiracion(url: str) -> dict:
     return info
 
 
+def detectar_extension_texto(contenido: bytes) -> str:
+    """Detecta tipos de documento de texto (JSON, HTML, XML, CSV/plano)."""
+    try:
+        texto = contenido[:2048].decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError:
+        return ""
+
+    if not texto:
+        return ""
+
+    if texto[0] in ("{", "["):
+        try:
+            json.loads(contenido.decode("utf-8"))
+            return ".json"
+        except Exception:
+            pass
+
+    texto_lower = texto.lower()
+    if texto_lower.startswith("<!doctype html") or "<html" in texto_lower[:200]:
+        return ".html"
+
+    if texto.startswith("<?xml"):
+        return ".xml"
+
+    # Texto plano: si es imprimible y tiene saltos de línea / comas típicas de CSV
+    imprimible = all(c.isprintable() or c in "\r\n\t" for c in texto)
+    if imprimible:
+        if texto.count(",") > 2 and "\n" in texto:
+            return ".csv"
+        return ".txt"
+
+    return ""
+
+
 def detectar_extension(contenido: bytes) -> str:
     if contenido[:4] == b"PK\x03\x04" or contenido[:4] == b"PK\x05\x06":
         try:
@@ -74,10 +108,15 @@ def detectar_extension(contenido: bytes) -> str:
         return ".gif"
     if contenido[:4] == b"\xd0\xcf\x11\xe0":
         return ".xls"
+
+    ext_texto = detectar_extension_texto(contenido)
+    if ext_texto:
+        return ext_texto
+
     return ""
 
 
-def nombre_archivo(url: str, response: requests.Response) -> str:
+def nombre_archivo(url: str, response: requests.Response, tipo_documento: str = "") -> str:
     contenido = response.content
 
     cd = response.headers.get("content-disposition", "")
@@ -97,6 +136,11 @@ def nombre_archivo(url: str, response: requests.Response) -> str:
             response.headers.get("content-type", "").split(";")[0]
         ) or ".bin"
         nombre = nombre + ext_ct
+
+    if tipo_documento:
+        tipo_limpio = tipo_documento.strip().strip("-_").replace(" ", "_")
+        nombre_base, ext_final = os.path.splitext(nombre)
+        nombre = f"{tipo_limpio}_{nombre_base}{ext_final}"
 
     return nombre
 
@@ -135,6 +179,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
     link = str(payload.get("link"))
     radicado = str(payload.get("radicado"))
+    tipo_documento = str(payload.get("tipo_documento"))
 
     try:
         meta_url = verificar_expiracion(link)
@@ -188,12 +233,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     contenido = response.content
-    nombre = nombre_archivo(link, response)
+    nombre = nombre_archivo(link, response, tipo_documento)
     extension = os.path.splitext(nombre)[1]
     contenido_b64 = base64.b64encode(contenido).decode("utf-8")
 
     log.info("documento descargado", extra={
         "radicado": radicado,
+        "tipo_documento": tipo_documento,
         "nombre": nombre,
         "tamano": len(contenido),
     })
@@ -202,6 +248,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         "status": "ok",
         "message": "Documento descargado correctamente",
         "radicado": radicado,
+        "tipo_documento": tipo_documento,
         "info": {
             "nombre_archivo": nombre,
             "extension": extension,
