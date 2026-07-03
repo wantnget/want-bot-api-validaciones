@@ -65,7 +65,7 @@ def extraer_texto_pdf(contenido_bytes: bytes) -> str:
     return texto
 
 
-# ---------- Extractores por tipo de documento ----------
+# ---------- Carta Laboral ----------
 
 def extraer_datos_carta_laboral(texto: str):
     cedula_match = re.search(
@@ -81,7 +81,28 @@ def extraer_datos_carta_laboral(texto: str):
     return normalizar_nombre(nombre), normalizar_numero(cedula)
 
 
-def extraer_datos_desprendible(texto: str):
+# ---------- Desprendible de Pago ----------
+
+def extraer_datos_desprendible_tabla(pdf_bytes: bytes):
+    """Extrae por tablas: une correctamente celdas con nombre en varias lineas."""
+    nombre = None
+    cedula = None
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for pagina in pdf.pages:
+            for tabla in pagina.extract_tables():
+                for fila in tabla:
+                    celdas = [(c or "").replace("\n", " ").strip() for c in fila]
+                    for i, celda in enumerate(celdas):
+                        etiqueta = quitar_tildes(celda).lower()
+                        if etiqueta == "empleado" and nombre is None and i + 1 < len(celdas):
+                            nombre = celdas[i + 1]
+                        if etiqueta == "cedula" and cedula is None and i + 1 < len(celdas):
+                            cedula = celdas[i + 1]
+    return normalizar_nombre(nombre), normalizar_numero(cedula)
+
+
+def extraer_datos_desprendible_texto(texto: str):
+    """Fallback por texto plano (PDFs sin lineas de tabla detectables)."""
     cedula_match = re.search(
         r"C[eé]dula\s*:?\s*([\d\.,]{6,})", texto, re.IGNORECASE
     )
@@ -93,6 +114,19 @@ def extraer_datos_desprendible(texto: str):
     nombre = nombre_match.group(1) if nombre_match else None
 
     return normalizar_nombre(nombre), normalizar_numero(cedula)
+
+
+def extraer_datos_desprendible(pdf_bytes: bytes):
+    """Primero intenta por tabla; si falta algo, complementa con texto plano."""
+    nombre, cedula = extraer_datos_desprendible_tabla(pdf_bytes)
+
+    if not nombre or not cedula:
+        texto = extraer_texto_pdf(pdf_bytes)
+        nombre_txt, cedula_txt = extraer_datos_desprendible_texto(texto)
+        nombre = nombre or nombre_txt
+        cedula = cedula or cedula_txt
+
+    return nombre, cedula
 
 
 # ---------- Obtener documentos por radicado ----------
@@ -209,7 +243,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         texto_carta = extraer_texto_pdf(documentos["carta_laboral"])
-        texto_desp = extraer_texto_pdf(documentos["desprendible"])
+        nombre_carta, cedula_carta = extraer_datos_carta_laboral(texto_carta)
+
+        # el desprendible recibe BYTES (tabla + fallback texto)
+        nombre_desp, cedula_desp = extraer_datos_desprendible(
+            documentos["desprendible"])
     except Exception as exc:
         log.warning("fallo lectura pdf", extra={
                     "radicado": radicado, "error": str(exc)})
@@ -219,9 +257,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             status_code=422,
             mimetype="application/json",
         )
-
-    nombre_carta, cedula_carta = extraer_datos_carta_laboral(texto_carta)
-    nombre_desp, cedula_desp = extraer_datos_desprendible(texto_desp)
 
     nombres_coinciden = (
         nombre_truora == nombre_carta == nombre_desp
