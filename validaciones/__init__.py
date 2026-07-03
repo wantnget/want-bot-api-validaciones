@@ -11,6 +11,7 @@ import azure.functions as func
 from shared.auth import validar_api_key
 from shared.exceptions import AuthError
 from shared.logger import get_logger
+from shared import blob_client
 
 log = get_logger("validar_identidad")
 
@@ -263,6 +264,28 @@ def obtener_documentos_radicado(radicado: str) -> dict:
     return documentos
 
 
+# ---------- Blob (best-effort: si falla, no rompe la respuesta) ----------
+
+def _guardar_blob_req(radicado: str, payload: dict) -> str:
+    try:
+        blob_client.save_validacion_req(radicado, payload)
+        return "OK"
+    except Exception as exc:
+        log.warning("fallo blob req", extra={
+                    "radicado": radicado, "error": str(exc)})
+        return f"ERROR: {str(exc)[:200]}"
+
+
+def _guardar_blob_res(radicado: str, out: dict) -> str:
+    try:
+        blob_client.save_validacion_res(radicado, out)
+        return "OK"
+    except Exception as exc:
+        log.warning("fallo blob res", extra={
+                    "radicado": radicado, "error": str(exc)})
+        return f"ERROR: {str(exc)[:200]}"
+
+
 # ---------- Handler ----------
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -301,23 +324,29 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     nombre_truora = normalizar_nombre(str(payload.get("nombre")))
     cedula_truora = normalizar_numero(str(payload.get("cedula")))
 
+    # Guardar el request en Blob por radicado
+    blob_req_status = _guardar_blob_req(radicado, payload)
+
     try:
         documentos = obtener_documentos_radicado(radicado)
     except ValueError as exc:
         log.warning("documentos no encontrados", extra={
                     "radicado": radicado, "error": str(exc)})
+        out = {"status": "error", "radicado": radicado, "error": str(exc)}
+        _guardar_blob_res(radicado, out)
         return func.HttpResponse(
-            json.dumps(
-                {"status": "error", "radicado": radicado, "error": str(exc)}),
+            json.dumps(out),
             status_code=404,
             mimetype="application/json",
         )
     except Exception as exc:
         log.warning("fallo consulta db", extra={
                     "radicado": radicado, "error": str(exc)})
+        out = {"status": "error", "radicado": radicado,
+               "error": f"Error consultando DB: {str(exc)[:200]}"}
+        _guardar_blob_res(radicado, out)
         return func.HttpResponse(
-            json.dumps({"status": "error", "radicado": radicado,
-                        "error": f"Error consultando DB: {str(exc)[:200]}"}),
+            json.dumps(out),
             status_code=502,
             mimetype="application/json",
         )
@@ -327,9 +356,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     if faltan_docs:
         log.warning("documentos incompletos", extra={
                     "radicado": radicado, "faltan": faltan_docs})
+        out = {"status": "error", "radicado": radicado,
+               "error": f"Faltan documentos: {faltan_docs}"}
+        _guardar_blob_res(radicado, out)
         return func.HttpResponse(
-            json.dumps({"status": "error", "radicado": radicado,
-                        "error": f"Faltan documentos: {faltan_docs}"}),
+            json.dumps(out),
             status_code=404,
             mimetype="application/json",
         )
@@ -344,9 +375,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         log.warning("fallo lectura pdf", extra={
                     "radicado": radicado, "error": str(exc)})
+        out = {"status": "error", "radicado": radicado,
+               "error": f"Error leyendo PDF: {str(exc)[:200]}"}
+        _guardar_blob_res(radicado, out)
         return func.HttpResponse(
-            json.dumps({"status": "error", "radicado": radicado,
-                        "error": f"Error leyendo PDF: {str(exc)[:200]}"}),
+            json.dumps(out),
             status_code=422,
             mimetype="application/json",
         )
@@ -386,12 +419,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError as exc:
             log.warning("fallo campos calculados", extra={
                         "radicado": radicado, "error": str(exc)})
+            out_err = {"status": "error", "radicado": radicado,
+                       "error": f"Error calculando campos: {str(exc)[:200]}"}
+            _guardar_blob_res(radicado, out_err)
             return func.HttpResponse(
-                json.dumps({"status": "error", "radicado": radicado,
-                            "error": f"Error calculando campos: {str(exc)[:200]}"}),
+                json.dumps(out_err),
                 status_code=422,
                 mimetype="application/json",
             )
+
+    # Guardar el response en Blob por radicado
+    blob_res_status = _guardar_blob_res(radicado, out)
+    out["blob_status"] = {"request": blob_req_status, "response": blob_res_status}
 
     log.info("validacion completada", extra={
         "radicado": radicado,
@@ -402,4 +441,4 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         json.dumps(out, ensure_ascii=False),
         status_code=200,
         mimetype="application/json",
-    ) 
+    )
