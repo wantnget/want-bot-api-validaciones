@@ -5,4 +5,5 @@
 azure-functions
 requests
 psycopg2-binary
-pdfplumber 
+pdfplumber
+azure-storage-blob
