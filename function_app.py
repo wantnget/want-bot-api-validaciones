@@ -1,4 +1,5 @@
 import azure.functions as func
+import boletas
 import documentos
 import validaciones
 
@@ -11,3 +12,7 @@ def descargar_truora_route(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="validar_identidad", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def validar_identidad_route(req: func.HttpRequest) -> func.HttpResponse:
     return validaciones.main(req)
+
+@app.route(route="obtener_codigo", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def obtener_codigo_route(req: func.HttpRequest) -> func.HttpResponse:
+    return boletas.main(req)
