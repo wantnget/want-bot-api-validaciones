@@ -77,13 +77,16 @@ def extraer_texto_pdf(contenido_bytes: bytes) -> str:
 # ---------- Carta Laboral ----------
 
 def extraer_datos_carta_laboral(texto: str):
+    # Tolera saltos de línea entre palabras y variantes "No.", "No", "N°", "número"
     cedula_match = re.search(
-        r"c[eé]dula de ciudadan[ií]a\s*No\.?\s*([\d\.]+)", texto, re.IGNORECASE
+        r"c[eé]dula\s+de\s+ciudadan[ií]a\s*(?:No\.?|N[°º]\.?|n[uú]mero)?\s*:?\s*([\d\.,]{6,})",
+        texto, re.IGNORECASE,
     )
     cedula = cedula_match.group(1) if cedula_match else None
 
+    # "identificado" / "identificada"
     nombre_match = re.search(
-        r"[Qq]ue\s+([A-ZÁÉÍÓÚÑ\s]+),\s*identificado", texto
+        r"\b[Qq]ue\s+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s]+?)\s*,?\s*identificad[oa]", texto
     )
     nombre = nombre_match.group(1) if nombre_match else None
 
@@ -92,6 +95,35 @@ def extraer_datos_carta_laboral(texto: str):
 
 # ---------- Desprendible de Pago: nombre y cédula ----------
 
+ETIQUETAS_DESPRENDIBLE = {
+    "empleado", "cedula", "cargo", "tipo de contrato",
+    "periodo de pago", "fecha de pago",
+}
+
+
+def _etiqueta(celda: str) -> str:
+    return quitar_tildes(celda).lower().rstrip(":").strip()
+
+
+def _valor_de_etiqueta(filas: list, r: int, i: int):
+    fila = filas[r]
+    fin = len(fila)
+    for j in range(i + 1, len(fila)):
+        if fila[j]:
+            if _etiqueta(fila[j]) in ETIQUETAS_DESPRENDIBLE:
+                fin = j
+                break
+            return fila[j]
+
+    for rr in (r - 1, r + 1):
+        if 0 <= rr < len(filas):
+            vecina = filas[rr]
+            for j in range(i, min(fin, len(vecina))):
+                if vecina[j] and _etiqueta(vecina[j]) not in ETIQUETAS_DESPRENDIBLE:
+                    return vecina[j]
+    return None
+
+
 def extraer_datos_desprendible_tabla(pdf_bytes: bytes):
     """Extrae por tablas: une correctamente celdas con nombre en varias líneas."""
     nombre = None
@@ -99,14 +131,15 @@ def extraer_datos_desprendible_tabla(pdf_bytes: bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for pagina in pdf.pages:
             for tabla in pagina.extract_tables():
-                for fila in tabla:
-                    celdas = [(c or "").replace("\n", " ").strip() for c in fila]
+                filas = [[(c or "").replace("\n", " ").strip() for c in fila]
+                         for fila in tabla]
+                for r, celdas in enumerate(filas):
                     for i, celda in enumerate(celdas):
-                        etiqueta = quitar_tildes(celda).lower()
-                        if etiqueta == "empleado" and nombre is None and i + 1 < len(celdas):
-                            nombre = celdas[i + 1]
-                        if etiqueta == "cedula" and cedula is None and i + 1 < len(celdas):
-                            cedula = celdas[i + 1]
+                        etiqueta = _etiqueta(celda)
+                        if etiqueta == "empleado" and not nombre:
+                            nombre = _valor_de_etiqueta(filas, r, i)
+                        if etiqueta == "cedula" and not cedula:
+                            cedula = _valor_de_etiqueta(filas, r, i)
     return normalizar_nombre(nombre), normalizar_numero(cedula)
 
 
@@ -121,6 +154,21 @@ def extraer_datos_desprendible_texto(texto: str):
         r"Empleado\s*:?\s*(.+?)\s+C[eé]dula", texto, re.IGNORECASE | re.DOTALL
     )
     nombre = nombre_match.group(1) if nombre_match else None
+
+    if nombre:
+        cont_match = re.search(
+            r"Empleado.*?C[eé]dula\s*:?\s*[\d\.,]{6,}[^\n]*\n([^\n]*)",
+            texto, re.IGNORECASE | re.DOTALL,
+        )
+        if cont_match:
+            continuacion = cont_match.group(1).strip()
+            palabras = continuacion.split()
+            if (palabras and len(palabras) <= 3
+                    and re.fullmatch(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü\s]+", continuacion)
+                    and _etiqueta(palabras[0]) not in ETIQUETAS_DESPRENDIBLE
+                    and not any(_etiqueta(continuacion).startswith(e)
+                                for e in ETIQUETAS_DESPRENDIBLE)):
+                nombre = f"{nombre} {continuacion}"
 
     return normalizar_nombre(nombre), normalizar_numero(cedula)
 
